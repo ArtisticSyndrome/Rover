@@ -1,0 +1,834 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Rover Nav Sim</title>
+<style>
+  :root{--bg:#140c08e6;--line:#ffffff2e;--fg:#f3e3d3;--dim:#d9c3ae;--accent:#66ffcc;--warn:#ff7a66}
+  html,body{margin:0;height:100%;overflow:hidden;background:#1a0f0a;color:var(--fg);font:12px/1.55 ui-monospace,Consolas,monospace}
+  canvas{display:block}
+  ::selection{background:var(--accent);color:#140c08}
+  .panel{position:fixed;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:10px 12px}
+  #hud{left:12px;top:12px;min-width:236px;white-space:pre;transition:border-color .2s}
+  #hud[data-state="NO PATH"]{border-color:var(--warn)}
+  #hud[data-state="ARRIVED"]{border-color:var(--accent)}
+  #help{right:12px;top:12px;max-width:270px;color:var(--dim)}
+  #help summary{cursor:pointer;color:var(--fg)}
+  #bar{left:12px;bottom:12px;right:236px;display:flex;gap:6px;flex-wrap:wrap;padding:0;background:none;border:0;pointer-events:none}
+  #bar button{pointer-events:auto}
+  #mini{right:12px;bottom:12px;padding:6px}
+  #mini canvas{width:200px;height:200px;border-radius:4px;cursor:crosshair;touch-action:none}
+  #mini small{display:block;margin-top:4px;color:var(--dim);font-size:10px}
+  button{font:inherit;color:inherit;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:6px 10px;cursor:pointer}
+  button:hover{background:#3a2216}
+  :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  .sw{display:inline-block;width:9px;height:9px;margin:0 4px 0 8px;border-radius:2px;vertical-align:-1px;border:1px solid var(--line)}
+  @media(pointer:coarse),(max-width:640px){button{min-height:44px;padding:8px 14px}}
+  @media(max-width:640px){#bar{right:12px}#mini{top:64px;bottom:auto}#mini canvas{width:112px;height:112px}}
+</style>
+</head>
+<body>
+<div id="hud" class="panel" role="region" aria-label="Rover telemetry"></div>
+<details id="help" class="panel">
+  <summary>Help &amp; legend</summary>
+  <div style="margin-top:6px">
+    <b>Click</b> terrain or minimap → set goal<br>
+    <b>Shift+click</b> → drop boulder (or use the button)<br>
+    <b>C</b> cycles orbit / chase / free-roam. Free: WASD/arrows move, Q/E down/up, Shift fast. Drag looks (X switches drag to move; right-drag always moves). Trackpad: two-finger scroll looks, pinch dollies. Alt+wheel = fly speed.<br>
+    <b>Continuous</b>: maps while driving. <b>Stop &amp; scan</b>: halts, sweeps, computes, then drives a short leg.<br>
+    The rover avoids slopes over 20°, hazards taller than its 0.3 m clearance, and prefers smooth ground. Hills hide what is behind them.
+    <div style="margin-top:6px"><span class="sw" style="margin-left:0;background:#000a"></span>unknown<span class="sw" style="background:#5adcff55"></span>free<span class="sw" style="background:#ffd746aa"></span>rough<span class="sw" style="background:#ff3228"></span>rock<span class="sw" style="background:#b05cff"></span>steep<span class="sw" style="background:#ffaa28aa"></span>padding</div>
+  </div>
+</details>
+<div id="bar" class="panel" role="toolbar" aria-label="Simulation controls">
+  <button id="bMode">Mode: continuous (M)</button>
+  <button id="bDrop">Drop obstacle ahead (O)</button>
+  <button id="bCam">Camera: orbit (C)</button>
+  <button id="bDrag" hidden>Drag: look (X)</button>
+  <button id="bSpd">Speed 1× (S)</button>
+  <button id="bRst">Reset (R)</button>
+</div>
+<div id="mini" class="panel">
+  <canvas id="miniC" width="256" height="256" role="img" aria-label="Top-down map. Click to set a goal."></canvas>
+  <small>Top view · click to set goal</small>
+</div>
+
+<script type="importmap">
+{"imports":{
+  "three":"https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+  "three/addons/":"https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+}}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import {OrbitControls} from 'three/addons/controls/OrbitControls.js';
+
+// ---------- world / tuning ----------
+const SIZE=90, CELL=0.5, N=SIZE/CELL, HALF=SIZE/2;
+const START={x:-34,z:-34}, GOAL={x:32,z:30};
+const FOV=1.75, RANGE=10;                      // continuous camera: ~100°, 10 m
+const ARC=2.6, SCAN_DUR=2.4, PROC_DUR=1.3, DRIVE_DIST=4;   // stop-and-scan: sweep arc (rad), seconds, metres per leg
+const SLOPE_MAX=Math.tan(20*Math.PI/180);      // lethal above 20°
+const CLR0=0.47;                              // chassis underside height (m); low rocks are capped at 0.3 m so they stay climbable
+const VMAX=1.6, WMAX=2.2, ACC=3, LOOK=1.2;     // rover limits (m/s, rad/s, m/s², m)
+const KP=2.2, KI=0.1, KD=0.15;                 // heading PID — tune per real hardware
+const WHEEL_R=0.22, TRACK=0.52;
+const cellOf=v=>Math.min(N-1,Math.max(0,Math.floor((v+HALF)/CELL)));
+const centerOf=i=>-HALF+(i+0.5)*CELL;
+const wrap=a=>Math.atan2(Math.sin(a),Math.cos(a));
+const clamp=(v,a,b)=>Math.min(b,Math.max(a,v));
+const V3=THREE.Vector3;
+
+// ---------- terrain ----------
+const craters=[[8,-6,4.5],[-10,12,4],[14,15,3.5],[-14,-4,3],[-30,-8,3.5],[20,-30,4],[-4,34,4],[36,5,3.5],[-22,38,3]];
+const hills=[[-10,-20,8,4.2],[26,-12,9,4.6],[-28,18,8,3.8],[10,22,7,3.2],[-2,-2,6,2.4]];
+function H(x,z){
+  let h=0.9*Math.sin(x*.11+1)*Math.cos(z*.09)+0.5*Math.sin(x*.23+z*.17)+0.15*Math.sin(x*.6)*Math.sin(z*.55)
+       +0.035*Math.sin(x*2.1+z*1.3)*Math.sin(z*1.9-x*.7);
+  for(const [cx,cz,R] of craters){
+    const r2=((x-cx)**2+(z-cz)**2)/(R*R);
+    h+=-1.2*Math.exp(-r2*1.5)+0.5*Math.exp(-((Math.sqrt(r2)-1)**2)*4);
+  }
+  for(const [cx,cz,R,a] of hills)h+=a*Math.exp(-((x-cx)**2+(z-cz)**2)/(R*R));
+  const d=Math.max(Math.abs(x),Math.abs(z));            // distant mountain rim, flat inside the playable area
+  if(d>52){const t=Math.min((d-52)/70,1.4);h+=t*t*38*(0.7+0.45*Math.sin(x*.045+1.3)*Math.sin(z*.05)+0.25*Math.sin(x*.13+z*.11))}
+  return h;
+}
+
+// ---------- renderer / scene ----------
+const renderer=new THREE.WebGLRenderer({antialias:true});
+renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+renderer.setSize(innerWidth,innerHeight);
+renderer.shadowMap.enabled=true;
+renderer.shadowMap.type=THREE.PCFSoftShadowMap;
+document.body.prepend(renderer.domElement);
+const SKY=0xd7a27c;
+const scene=new THREE.Scene();
+scene.background=new THREE.Color(SKY);
+scene.fog=new THREE.Fog(SKY,90,340);
+const camera=new THREE.PerspectiveCamera(55,innerWidth/innerHeight,.1,700);
+camera.position.set(-62,32,-62);
+const controls=new OrbitControls(camera,renderer.domElement);
+controls.target.set(-24,0,-24);
+controls.maxPolarAngle=Math.PI*0.49;
+controls.maxDistance=220;
+controls.enableDamping=true;
+
+scene.add(new THREE.HemisphereLight(0xffe2c8,0x5a3220,1.1));
+const sun=new THREE.DirectionalLight(0xfff0dd,2.6);
+sun.position.set(-40,60,30);
+sun.castShadow=true;
+sun.shadow.mapSize.set(4096,4096);
+Object.assign(sun.shadow.camera,{left:-58,right:58,top:58,bottom:-58,near:1,far:180});
+sun.shadow.bias=-0.0004;
+scene.add(sun);
+
+const tintA=new THREE.Color(0xc27c4c), tintB=new THREE.Color(0x8a4a2c), tc=new THREE.Color();
+function paintVerts(g,dy){
+  const p=g.attributes.position, col=new Float32Array(p.count*3);
+  for(let i=0;i<p.count;i++){
+    const x=p.getX(i), z=p.getZ(i), y=H(x,z);
+    p.setY(i,y+dy);
+    const n=clamp(0.5+0.35*Math.sin(x*.8+z*.3)*Math.sin(z*.7-x*.2)+0.35*Math.sin(x*.19+2)*Math.sin(z*.23),0,1);   // dust vs basalt patches
+    tc.copy(tintA).lerp(tintB,n*0.8).multiplyScalar(y<-0.4?0.8:1+Math.min(0.25,Math.max(0,y)*0.06)).toArray(col,i*3);
+  }
+  g.setAttribute('color',new THREE.BufferAttribute(col,3));
+  g.computeVertexNormals();
+}
+const geo=new THREE.PlaneGeometry(SIZE,SIZE,300,300).rotateX(-Math.PI/2);
+paintVerts(geo,0);
+const terrain=new THREE.Mesh(geo,new THREE.MeshStandardMaterial({vertexColors:true,roughness:1}));
+terrain.receiveShadow=true;
+scene.add(terrain);
+const outerGeo=new THREE.PlaneGeometry(640,640,220,220).rotateX(-Math.PI/2);   // surroundings + mountains, sits just under the playable mesh
+paintVerts(outerGeo,-0.08);
+scene.add(new THREE.Mesh(outerGeo,new THREE.MeshStandardMaterial({vertexColors:true,roughness:1})));
+
+// ---------- occupancy-map overlay (draped over the terrain) ----------
+const mapCanvas=document.createElement('canvas');
+mapCanvas.width=mapCanvas.height=N;
+const mctx=mapCanvas.getContext('2d'), img=mctx.createImageData(N,N);
+const mapTex=new THREE.CanvasTexture(mapCanvas);
+mapTex.magFilter=THREE.NearestFilter;
+mapTex.colorSpace=THREE.SRGBColorSpace;
+const overlay=new THREE.Mesh(geo,new THREE.MeshBasicMaterial({map:mapTex,transparent:true,depthWrite:false,polygonOffset:true,polygonOffsetFactor:-2,polygonOffsetUnits:-2}));
+overlay.renderOrder=1;
+scene.add(overlay);
+
+// ---------- rocks ----------
+function mulberry32(a){return()=>{a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296}}
+const rnd=mulberry32(7);
+const truth=new Uint8Array(N*N);      // tall rocks: lethal
+const lowGrid=new Uint8Array(N*N);    // low rocks: climbable, but rough
+const rocks=[];                       // tall rocks {x,z,r,h,mesh}
+const lowRocks=[];                    // low rocks {x,z,r,h}
+let baseRocks=0;
+const rockMat=new THREE.MeshStandardMaterial({color:0x5b4538,roughness:1,flatShading:true});
+function makeRock(x,z,r){
+  const g=new THREE.IcosahedronGeometry(r,1), p=g.attributes.position, s=rnd()*10;
+  for(let i=0;i<p.count;i++){
+    const f=1+0.18*Math.sin(p.getX(i)*5/r+s)*Math.sin(p.getZ(i)*4/r+s*2)+0.08*Math.sin(p.getY(i)*9/r+s);
+    p.setXYZ(i,p.getX(i)*f,p.getY(i)*f*0.7,p.getZ(i)*f);
+  }
+  g.computeVertexNormals();
+  const m=new THREE.Mesh(g,rockMat);
+  m.castShadow=m.receiveShadow=true;
+  m.rotation.y=rnd()*6.28;
+  m.position.set(x,H(x,z)+r*0.2,z);
+  scene.add(m);
+  return {x,z,r,h:r*0.9,mesh:m};
+}
+function stamp(o,grid=truth,pad=0.1){
+  for(let j=cellOf(o.z-o.r-1);j<=cellOf(o.z+o.r+1);j++)for(let i=cellOf(o.x-o.r-1);i<=cellOf(o.x+o.r+1);i++)
+    if(Math.hypot(centerOf(i)-o.x,centerOf(j)-o.z)<=o.r+pad)grid[j*N+i]=1;
+}
+const nearKeyPoint=(x,z,a,b)=>Math.hypot(x-START.x,z-START.z)<a||Math.hypot(x-GOAL.x,z-GOAL.z)<b;
+for(let tries=0;rocks.length<110&&tries<8000;tries++){
+  const x=(rnd()*2-1)*41, z=(rnd()*2-1)*41, r=0.45+rnd()*rnd()*1.6;
+  if(nearKeyPoint(x,z,6,5)||rocks.some(o=>Math.hypot(o.x-x,o.z-z)<o.r+r+2.8))continue;
+  const o=makeRock(x,z,r); rocks.push(o); stamp(o);
+}
+baseRocks=rocks.length;
+const falling=[];          // dropped boulders still in the air (sensor can't see them yet)
+
+{ // low rocks (climbable, add roughness) + decorative pebbles, both instanced
+  const pebble=new THREE.IcosahedronGeometry(1,0), m4=new THREE.Matrix4(), q=new THREE.Quaternion(), e=new THREE.Euler(), sc=new V3(), ps=new V3();
+  const inst=(count,place)=>{
+    const im=new THREE.InstancedMesh(pebble,rockMat,count);
+    for(let i=0;i<count;i++){
+      const o=place();
+      q.setFromEuler(e.set(rnd()*6.28,rnd()*6.28,rnd()*6.28));
+      im.setMatrixAt(i,m4.compose(ps.set(o.x,H(o.x,o.z)+o.r*0.15,o.z),q,sc.set(o.r,o.r*0.65,o.r)));
+    }
+    scene.add(im);
+    return im;
+  };
+  
+  inst(110,()=>{
+    for(;;){
+      const x=(rnd()*2-1)*41, z=(rnd()*2-1)*41, r=0.18+rnd()*0.15;
+      if(nearKeyPoint(x,z,4,3)||rocks.some(o=>Math.hypot(o.x-x,o.z-z)<o.r+r+0.4))continue;
+      const o={x,z,r,h:r*0.9}; lowRocks.push(o); stamp(o,lowGrid,0.2);
+      return o;
+    }
+  }).castShadow=true;
+  inst(1800,()=>({x:(rnd()*2-1)*80,z:(rnd()*2-1)*80,r:0.04+rnd()*0.09}));
+}
+
+// ---------- precomputed terrain analysis (what a DEM from stereo depth would give) ----------
+const hg=new Float32Array(N*N);       // height per cell
+const slope=new Float32Array(N*N);    // tan(slope angle)
+const penT=new Float32Array(N*N);     // traversal penalty: slope + crest + low rocks
+const baseC=document.createElement('canvas');   // static top-view shading for the minimap
+baseC.width=baseC.height=N;
+{
+  const bctx=baseC.getContext('2d'), bi=bctx.createImageData(N,N), lo=new THREE.Color(0x5a2f1d), hi=new THREE.Color(0xe0b184), c=new THREE.Color();
+  for(let j=0;j<N;j++)for(let i=0;i<N;i++){
+    const k=j*N+i, x=centerOf(i), z=centerOf(j);
+    const h0=H(x,z), xp=H(x+CELL,z), xn=H(x-CELL,z), zp=H(x,z+CELL), zn=H(x,z-CELL);
+    hg[k]=h0;
+    slope[k]=Math.hypot(xp-xn,zp-zn)/(2*CELL);
+    const crest=h0-(xp+xn+zp+zn)/4;
+    penT[k]=clamp((slope[k]-0.18)/(SLOPE_MAX-0.18),0,1)*4+Math.min(3,Math.max(0,crest-0.12)*12)+(lowGrid[k]?2.5:0);
+    c.copy(lo).lerp(hi,clamp((h0+2)/6.5,0,1)).multiplyScalar(clamp(1+(xn-xp+zn-zp)*0.9,0.55,1.45));
+    bi.data.set([c.r*255,c.g*255,c.b*255,255].map(Math.round),k*4);   // linear→display approximation is fine for a minimap
+  }
+  bctx.putImageData(bi,0,0);
+}
+
+// ---------- rover model (local +X forward, +Y up) ----------
+const rover=new THREE.Group();
+const wheels=[];
+const lensMat=new THREE.MeshStandardMaterial({color:0x44ddff,emissive:0x44ddff,emissiveIntensity:.8,roughness:.2});
+const head=new THREE.Group();          // camera head: pans while scanning
+head.position.set(.4,1.46,0);
+rover.add(head);
+let fan;
+{
+  const white=new THREE.MeshStandardMaterial({color:0xe6e1d8,roughness:.5,metalness:.2});
+  const gold=new THREE.MeshStandardMaterial({color:0xc9a24a,roughness:.35,metalness:.6});
+  const dark=new THREE.MeshStandardMaterial({color:0x222222,roughness:.8});
+  const metal=new THREE.MeshStandardMaterial({color:0x9a9a9a,roughness:.4,metalness:.7});
+  const solar=new THREE.MeshStandardMaterial({color:0x1b2a4e,roughness:.25,metalness:.5});
+  const add=(geom,mat,x,y,z,parent=rover)=>{const m=new THREE.Mesh(geom,mat);m.position.set(x,y,z);m.castShadow=true;parent.add(m);return m};
+  const B=(w,h,d)=>new THREE.BoxGeometry(w,h,d);
+  add(B(1.2,.3,.7),gold,0,.62,0);                       // warm electronics box
+  add(B(1.05,.04,.95),solar,-.05,.8,0);                 // solar deck
+  add(new THREE.CylinderGeometry(.035,.035,.62),metal,.4,1.1,0);  // mast
+  add(B(.2,.14,.34),white,0,0,0,head);                  // camera head
+  for(const z of[-.09,.09])add(new THREE.CylinderGeometry(.04,.04,.06).rotateZ(Math.PI/2),lensMat,.12,0,z,head);
+  const dish=add(new THREE.SphereGeometry(.16,14,6,0,Math.PI*2,0,Math.PI/2),white,-.4,1.1,.12);
+  dish.rotation.z=.6; dish.rotation.x=Math.PI;
+  add(new THREE.CylinderGeometry(.02,.02,.3),metal,-.4,.95,.12);
+  for(const z of[-TRACK+.02,TRACK-.02]){
+    add(B(1.2,.05,.05),metal,0,.4,z);                   // rocker
+    add(B(.05,.35,.05),metal,0,.52,z*.7);
+  }
+  const rubber=new THREE.CylinderGeometry(WHEEL_R,WHEEL_R,.17,20).rotateX(Math.PI/2);
+  for(const x of[-.55,0,.55])for(const side of[-1,1]){
+    const w=new THREE.Group();
+    add(rubber,dark,0,0,0,w);
+    add(new THREE.CylinderGeometry(.1,.1,.19,10).rotateX(Math.PI/2),metal,0,0,0,w);
+    for(let k=0;k<8;k++){                               // lugs, so spin is visible
+      const a=k*Math.PI/4, l=add(B(.07,.05,.17),dark,Math.cos(a)*WHEEL_R,Math.sin(a)*WHEEL_R,0,w);
+      l.rotation.z=a;
+    }
+    w.position.set(x,WHEEL_R,side*TRACK);
+    w.userData.side=side;
+    rover.add(w); wheels.push(w);
+    add(B(.04,.2,.04),metal,x,.33,side*(TRACK-.02));    // strut
+  }
+  fan=new THREE.Mesh(new THREE.CircleGeometry(RANGE,40,-FOV/2,FOV).rotateX(-Math.PI/2),
+    new THREE.MeshBasicMaterial({color:0x66ddff,transparent:true,opacity:.07,side:THREE.DoubleSide,depthWrite:false}));
+  head.add(fan);                                        // camera FOV
+}
+scene.add(rover);
+
+const marker=new THREE.Group();
+{
+  const m=new THREE.MeshBasicMaterial({color:0x66ffcc,transparent:true,opacity:.9});
+  marker.add(new THREE.Mesh(new THREE.RingGeometry(.55,.75,32).rotateX(-Math.PI/2),m));
+  const pole=new THREE.Mesh(new THREE.CylinderGeometry(.03,.03,2.2),m); pole.position.y=1.1; marker.add(pole);
+  const flag=new THREE.Mesh(new THREE.PlaneGeometry(.7,.4),new THREE.MeshBasicMaterial({color:0x66ffcc,side:THREE.DoubleSide}));
+  flag.position.set(.35,2,0); marker.add(flag);
+}
+scene.add(marker);
+const pathLine=new THREE.Line(new THREE.BufferGeometry(),new THREE.LineBasicMaterial({color:0x66ffcc}));
+pathLine.frustumCulled=false;
+scene.add(pathLine);
+
+// ---------- scan effects: lidar points, draped radar sweep, processing rings ----------
+const PN=6000, pPos=new Float32Array(PN*3), pCol=new Float32Array(PN*3), pBase=new Float32Array(PN*3), pLife=new Float32Array(PN);
+let pHead=0;
+const pointsGeo=new THREE.BufferGeometry();
+pointsGeo.setAttribute('position',new THREE.BufferAttribute(pPos,3));
+pointsGeo.setAttribute('color',new THREE.BufferAttribute(pCol,3));
+const points=new THREE.Points(pointsGeo,new THREE.PointsMaterial({size:.12,vertexColors:true,transparent:true,depthWrite:false,blending:THREE.AdditiveBlending}));
+points.frustumCulled=false;
+scene.add(points);
+const PCOLS=[[.35,.9,1],[1,.3,.25],[.75,.4,1]];   // surface, rock, steep
+function addPoint(x,z,kind){
+  const i=pHead++%PN, c=PCOLS[kind];
+  pPos.set([x,H(x,z)+.12,z],i*3); pBase.set(c,i*3); pLife[i]=1;
+}
+function updatePoints(dt){
+  for(let i=0;i<PN;i++){
+    if(pLife[i]<=0)continue;
+    const f=Math.max(0,pLife[i]-=dt/1.4);
+    pCol[i*3]=pBase[i*3]*f; pCol[i*3+1]=pBase[i*3+1]*f; pCol[i*3+2]=pBase[i*3+2]*f;
+  }
+  pointsGeo.attributes.position.needsUpdate=pointsGeo.attributes.color.needsUpdate=true;
+}
+
+const SK=10, SM=22, SW=0.55;                       // sweep fan: angular × radial segments, trail width (rad)
+const sPos=new Float32Array((SK+1)*(SM+1)*3), sCol=new Float32Array((SK+1)*(SM+1)*4), sIdx=[];
+for(let k=0;k<=SK;k++)for(let m=0;m<=SM;m++){
+  sCol.set([.2,.85,1,Math.pow(1-k/SK,1.6)*.5*(.05+.95*m/SM)],(k*(SM+1)+m)*4);
+  if(k<SK&&m<SM){const a=k*(SM+1)+m,c=a+SM+1;sIdx.push(a,a+1,c,a+1,c+1,c)}
+}
+const sweepGeo=new THREE.BufferGeometry();
+sweepGeo.setAttribute('position',new THREE.BufferAttribute(sPos,3));
+sweepGeo.setAttribute('color',new THREE.BufferAttribute(sCol,4));
+sweepGeo.setIndex(sIdx);
+const sweepMesh=new THREE.Mesh(sweepGeo,new THREE.MeshBasicMaterial({vertexColors:true,transparent:true,depthWrite:false,side:THREE.DoubleSide}));
+sweepMesh.frustumCulled=false; sweepMesh.renderOrder=2;
+const beamGeo=new THREE.BufferGeometry();
+beamGeo.setAttribute('position',new THREE.BufferAttribute(new Float32Array((SM+1)*3),3));
+const beam=new THREE.Line(beamGeo,new THREE.LineBasicMaterial({color:0xbff6ff}));
+beam.frustumCulled=false;
+scene.add(sweepMesh,beam);
+sweepMesh.visible=beam.visible=false;
+
+const mkRing=()=>{
+  const l=new THREE.LineLoop(new THREE.BufferGeometry().setAttribute('position',new THREE.BufferAttribute(new Float32Array(64*3),3)),
+    new THREE.LineBasicMaterial({color:0xffc060,transparent:true,depthWrite:false}));
+  l.frustumCulled=false; l.visible=false; scene.add(l); return l;
+};
+const rings=[mkRing(),mkRing()];
+function setRing(l,r,alpha){
+  const p=l.geometry.attributes.position;
+  for(let i=0;i<64;i++){const a=i/64*6.2832,x=S.x+Math.cos(a)*r,z=S.z+Math.sin(a)*r;p.setXYZ(i,x,H(x,z)+.2,z)}
+  p.needsUpdate=true; l.material.opacity=alpha; l.visible=alpha>.02;
+}
+
+// ---------- map / planner / controller state ----------
+const S={x:0,z:0,th:0,v:0,w:0};
+const known=new Uint8Array(N*N);      // 0 unknown, 1 free, 2 lethal
+const kind=new Uint8Array(N*N);       // for lethal cells: 1 rock, 2 too steep
+const pen=new Float32Array(N*N);      // penalty the rover has learned for known free cells
+const inflated=new Uint8Array(N*N);   // rover-radius padding around lethal cells
+let knownCount=0, goal=null, path=[], pi=0, state='IDLE', replans=0, msg='', I=0, prevE=0;
+let realistic=false, phase='DRIVE', scanT=0, scanA=0, procT=0, driven=0, simT=0;
+const lastPlan={ms:0,nodes:0};
+const tilt={p:0,r:0};
+const fx={show:false,a:0,dir:1};
+
+function inflate(i,j,rad){
+  for(let dj=-rad;dj<=rad;dj++)for(let di=-rad;di<=rad;di++){
+    const ni=i+di,nj=j+dj;
+    if(di*di+dj*dj<=rad*rad&&ni>=0&&nj>=0&&ni<N&&nj<N)inflated[nj*N+ni]=1;
+  }
+}
+function paintMap(){
+  const d=img.data;
+  for(let k=0;k<N*N;k++){
+    const s=known[k];
+    let r=90,g=220,b=255,a=34;
+    if(s===2){if(kind[k]===2){r=176;g=92;b=255;a=175}else{r=255;g=50;b=40;a=190}}
+    else if(inflated[k]){r=255;g=170;b=40;a=85}
+    else if(s===0){r=g=b=0;a=12}
+    else if(pen[k]>0.8){r=255;g=215;b=70;a=Math.min(140,30+pen[k]*20)}
+    const o=k*4; d[o]=r;d[o+1]=g;d[o+2]=b;d[o+3]=a;
+  }
+  mctx.putImageData(img,0,0);
+  mapTex.needsUpdate=true;
+}
+
+// One depth-camera ray. Simulated stand-in for the RTAB-Map perception stage:
+// reads ground truth, but respects range and terrain/rock occlusion, and derives slope + roughness for each newly seen cell.
+function castRay(ang){
+  const dx=Math.cos(ang), dz=Math.sin(ang), eye=hg[cellOf(S.z)*N+cellOf(S.x)]+1.5;
+  let hit=false, maxT=-1e9, changed=false, lx=S.x, lz=S.z, lc=0;
+  for(let d=0.4;d<=RANGE;d+=0.25){
+    const x=S.x+dx*d, z=S.z+dz*d;
+    if(Math.abs(x)>=HALF||Math.abs(z)>=HALF)break;
+    const i=cellOf(x), j=cellOf(z), k=j*N+i;
+    const t=(hg[k]+(truth[k]?0.5:0)-eye)/d;
+    if(!hit&&t<maxT-0.03)continue;                // hidden behind a hill or rock
+    if(t>maxT)maxT=t;
+    lx=x; lz=z;
+    if(truth[k]){                                  // keep marking through the rock: assume it is solid
+      hit=true; lc=1;
+      if(known[k]!==2||kind[k]!==1){if(!known[k])knownCount++;known[k]=2;kind[k]=1;inflate(i,j,2);changed=true}
+    }else if(hit)break;
+    else if(!known[k]){
+      knownCount++; changed=true;
+      if(slope[k]>SLOPE_MAX){known[k]=2;kind[k]=2;inflate(i,j,1);lc=2}
+      else{known[k]=1;pen[k]=penT[k]}
+    }
+  }
+  addPoint(lx,lz,lc);
+  if(Math.random()<0.2){const d=1+Math.random()*(RANGE-1);addPoint(S.x+dx*d,S.z+dz*d,0)}   // sparse ground returns
+  return changed;
+}
+function sense(){                                  // continuous mode: whole FOV at once
+  let changed=false;
+  for(let a=-FOV/2;a<=FOV/2;a+=0.015)changed=castRay(S.th+a)||changed;
+  if(changed)paintMap();
+  return changed;
+}
+
+function passable(k){return known[k]!==2&&!inflated[k]}
+function nearestFree(i,j){
+  for(let r=0;r<=8;r++)for(let dj=-r;dj<=r;dj++)for(let di=-r;di<=r;di++){
+    if(Math.max(Math.abs(di),Math.abs(dj))!==r)continue;
+    const ni=i+di,nj=j+dj;
+    if(ni>=0&&nj>=0&&ni<N&&nj<N&&passable(nj*N+ni))return[ni,nj];
+  }
+  return null;
+}
+
+// 8-connected A* with a binary heap. Unknown cells count as free (optimistic); lethal/padded cells are blocked;
+// learned slope/roughness penalties multiply the step cost so smooth ground wins.
+function astar(si,sj,gi,gj){
+  const s=sj*N+si, t=gj*N+gi;
+  const g=new Float32Array(N*N).fill(Infinity), from=new Int32Array(N*N).fill(-1), done=new Uint8Array(N*N);
+  // cells within 2 of the start are allowed even if padded, so the rover can escape a fresh obstacle
+  const ok=(i,j)=>i>=0&&j>=0&&i<N&&j<N&&known[j*N+i]!==2&&(!inflated[j*N+i]||Math.max(Math.abs(i-si),Math.abs(j-sj))<=2);
+  const h=(i,j)=>{const dx=Math.abs(i-gi),dz=Math.abs(j-gj);return 1.001*(Math.max(dx,dz)+0.414*Math.min(dx,dz))};
+  const hk=[], hn=[];
+  const push=(key,n)=>{let i=hk.length;hk.push(key);hn.push(n);while(i){const p=(i-1)>>1;if(hk[p]<=key)break;hk[i]=hk[p];hn[i]=hn[p];i=p}hk[i]=key;hn[i]=n};
+  const pop=()=>{
+    const n=hn[0], lk=hk.pop(), ln=hn.pop();
+    if(hk.length){let i=0;for(;;){let c=2*i+1;if(c>=hk.length)break;if(c+1<hk.length&&hk[c+1]<hk[c])c++;if(lk<=hk[c])break;hk[i]=hk[c];hn[i]=hn[c];i=c}hk[i]=lk;hn[i]=ln}
+    return n;
+  };
+  g[s]=0; push(h(si,sj),s);
+  let nodes=0;
+  while(hk.length){
+    const c=pop();
+    if(done[c])continue;
+    done[c]=1; nodes++;
+    if(c===t){lastPlan.nodes=nodes;const out=[];for(let k=c;k!==-1;k=from[k])out.push([k%N,(k/N)|0]);return out.reverse()}
+    const ci=c%N, cj=(c/N)|0;
+    for(let di=-1;di<=1;di++)for(let dj=-1;dj<=1;dj++){
+      if(!di&&!dj)continue;
+      const ni=ci+di,nj=cj+dj;
+      if(!ok(ni,nj)||(di&&dj&&!(ok(ci+di,cj)&&ok(ci,cj+dj))))continue;   // no corner cutting
+      const nk=nj*N+ni, ng=g[c]+(di&&dj?1.414:1)*(1+pen[nk]);
+      if(ng<g[nk]){g[nk]=ng;from[nk]=c;push(ng+h(ni,nj),nk)}
+    }
+  }
+  lastPlan.nodes=nodes;
+  return null;
+}
+
+function plan(){
+  const g=nearestFree(cellOf(goal.x),cellOf(goal.z));
+  path=[];
+  if(!g){state='NO PATH';msg='Goal unreachable';return}
+  goal.x=centerOf(g[0]); goal.z=centerOf(g[1]);
+  marker.position.set(goal.x,H(goal.x,goal.z),goal.z);
+  const t0=performance.now();
+  const p=astar(cellOf(S.x),cellOf(S.z),g[0],g[1]);
+  lastPlan.ms=performance.now()-t0;
+  if(!p){state='NO PATH';msg='No path — retrying as map grows';return}
+  path=p.map(([i,j])=>[centerOf(i),centerOf(j)]);
+  pi=Math.min(1,path.length-1);
+  state='NAVIGATING';
+}
+function setGoal(x,z){
+  goal={x:clamp(x,-HALF+1.5,HALF-1.5),z:clamp(z,-HALF+1.5,HALF-1.5)};
+  I=0; msg='New goal';
+  if(realistic){path=[];state='PLANNING';marker.position.set(goal.x,H(goal.x,goal.z),goal.z)}   // plans after the next scan
+  else plan();
+}
+const blockedAhead=()=>path.slice(pi).some(([x,z])=>{
+  const k=cellOf(z)*N+cellOf(x);
+  return known[k]===2||(inflated[k]&&Math.hypot(x-S.x,z-S.z)>1.5);
+});
+
+function drive(dt){
+  let vt=0, wt=0;
+  if(state==='NAVIGATING'&&phase==='DRIVE'&&path.length){
+    while(pi<path.length-1&&Math.hypot(path[pi][0]-S.x,path[pi][1]-S.z)<LOOK)pi++;
+    const dist=Math.hypot(goal.x-S.x,goal.z-S.z);
+    if(dist<0.35){state='ARRIVED';msg='Goal reached';I=0}
+    else{
+      const e=wrap(Math.atan2(path[pi][1]-S.z,path[pi][0]-S.x)-S.th);
+      I=clamp(I+e*dt,-1,1);
+      wt=clamp(KP*e+KI*I+KD*(e-prevE)/dt,-WMAX,WMAX);
+      prevE=e;
+      vt=VMAX*clamp(1-Math.abs(e)/1.1,0,1)*clamp(dist/1.5,0.25,1);   // turn in place when badly misaligned, ease in at goal
+      vt*=1-0.5*clamp(slope[cellOf(S.z)*N+cellOf(S.x)]/SLOPE_MAX,0,1);   // slow down on slopes
+    }
+  }
+  S.v+=clamp(vt-S.v,-ACC*dt*1.5,ACC*dt);
+  S.w=wt;
+  S.th=wrap(S.th+S.w*dt);
+  S.x=clamp(S.x+Math.cos(S.th)*S.v*dt,-HALF+1,HALF-1);
+  S.z=clamp(S.z+Math.sin(S.th)*S.v*dt,-HALF+1,HALF-1);
+  for(const o of rocks){                  // hard collision, in case the map was wrong
+    const d=Math.hypot(S.x-o.x,S.z-o.z), m=o.r+0.55;
+    if(d<m&&d>1e-3){S.x=o.x+(S.x-o.x)/d*m;S.z=o.z+(S.z-o.z)/d*m}
+  }
+}
+
+const qT=new THREE.Quaternion(), mT=new THREE.Matrix4();
+function applyPose(dt){
+  const c=Math.cos(S.th), s=Math.sin(S.th), sx=-s, sz=c;
+  const hF=H(S.x+c*.6,S.z+s*.6), hB=H(S.x-c*.6,S.z-s*.6), hL=H(S.x-sx*.5,S.z-sz*.5), hR=H(S.x+sx*.5,S.z+sz*.5);
+  const F=new V3(c*1.2,hF-hB,s*1.2);
+  const Y=new V3(sx,hR-hL,sz).cross(F).normalize();
+  const X=F.normalize(), Z=new V3().crossVectors(X,Y);
+  tilt.p=Math.asin(X.y)*57.2958; tilt.r=Math.asin(Z.y)*57.2958;
+  qT.setFromRotationMatrix(mT.makeBasis(X,Y,Z));
+  rover.quaternion.slerp(qT,1-Math.exp(-10*dt));
+  rover.position.set(S.x,(hF+hB+hL+hR)/4,S.z);
+  for(const w of wheels)w.rotation.z-=(S.v-S.w*TRACK*w.userData.side)*dt/WHEEL_R;   // differential speeds
+}
+function clearance(){                     // chassis underside minus the tallest low rock and any crest under it
+  const c=Math.cos(S.th), s=Math.sin(S.th);
+  const crest=H(S.x,S.z)-(H(S.x+c*.6,S.z+s*.6)+H(S.x-c*.6,S.z-s*.6))/2;
+  let low=0;
+  for(const o of lowRocks)if(Math.hypot(o.x-S.x,o.z-S.z)<o.r+0.45)low=Math.max(low,o.h);
+  return CLR0-Math.max(0,crest)-low;
+}
+
+function drawPath(){
+  const pts=[new V3(S.x,H(S.x,S.z)+.25,S.z)];
+  for(let i=pi;i<path.length;i++)pts.push(new V3(path[i][0],H(path[i][0],path[i][1])+.25,path[i][1]));
+  pathLine.geometry.dispose();
+  pathLine.geometry=new THREE.BufferGeometry().setFromPoints(state==='NAVIGATING'?pts:[]);
+}
+
+// scan visuals: radar sweep draped on the terrain, pulse rings while computing, head pan, status LED
+function updateFX(dt){
+  const live=state!=='ARRIVED'&&state!=='IDLE';
+  let show=false, a=0, dir=1;
+  if(live&&!realistic){show=true;const ph=simT*1.1;a=(FOV/2)*Math.sin(ph);dir=Math.cos(ph)>=0?1:-1}
+  else if(live&&realistic&&phase==='SCAN'){show=true;a=-ARC/2+ARC*clamp(scanT/SCAN_DUR,0,1)}
+  Object.assign(fx,{show,a,dir});
+  sweepMesh.visible=beam.visible=show;
+  fan.visible=live&&(!realistic||phase==='SCAN');
+  if(show){
+    for(let k=0;k<=SK;k++){
+      const ang=S.th+a-dir*SW*(k/SK), cx=Math.cos(ang), cz=Math.sin(ang);
+      for(let m=0;m<=SM;m++){
+        const r=0.8+(RANGE-0.8)*m/SM, x=S.x+cx*r, z=S.z+cz*r;
+        sPos.set([x,H(x,z)+.15,z],(k*(SM+1)+m)*3);
+        if(k===0)beamGeo.attributes.position.setXYZ(m,x,H(x,z)+.2,z);
+      }
+    }
+    sweepGeo.attributes.position.needsUpdate=beamGeo.attributes.position.needsUpdate=true;
+  }
+  const proc=realistic&&phase==='PROCESS', p=proc?procT/PROC_DUR:1, ease=t=>1-(1-t)**2;
+  if(proc){
+    setRing(rings[0],RANGE*ease(p),1-p);
+    const q=clamp((p-.25)/.75,0,1);
+    setRing(rings[1],RANGE*ease(q),p>.25?(1-q)*.8:0);
+  }else rings.forEach(r=>r.visible=false);
+  const want=realistic&&phase==='SCAN'?-a:0;
+  head.rotation.y+=(want-head.rotation.y)*(1-Math.exp(-8*dt));
+  const col=!live?0x55ff88:proc?0xffb030:(realistic&&phase==='DRIVE')?0x55ff88:0x44ddff;
+  lensMat.color.setHex(col); lensMat.emissive.setHex(col);
+  lensMat.emissiveIntensity=proc?.6+.4*Math.sin(simT*14):.8;
+}
+
+// ---------- obstacles ----------
+function dropRock(x,z,r){
+  x=clamp(x,-HALF+2,HALF-2); z=clamp(z,-HALF+2,HALF-2);
+  const o=makeRock(x,z,r);
+  o.mesh.position.y=H(x,z)+14;
+  falling.push(o);
+  msg='Boulder dropped';
+}
+function dropAhead(){
+  let x=S.x+Math.cos(S.th)*5, z=S.z+Math.sin(S.th)*5;
+  const p=path.slice(pi).find(q=>Math.hypot(q[0]-S.x,q[1]-S.z)>=4.5);   // land it on the planned route
+  if(p)[x,z]=p;
+  dropRock(x,z,0.9);
+}
+
+// ---------- lifecycle ----------
+function startScan(){phase='SCAN';scanT=0;scanA=-ARC/2;msg='Scanning surroundings'}
+function reset(){
+  for(const o of[...rocks.splice(baseRocks),...falling.splice(0)]){scene.remove(o.mesh);o.mesh.geometry.dispose()}
+  truth.fill(0); rocks.forEach(o=>stamp(o));
+  known.fill(0); inflated.fill(0); kind.fill(0); pen.fill(0); knownCount=0; pLife.fill(0);
+  Object.assign(S,{x:START.x,z:START.z,th:Math.atan2(GOAL.z-START.z,GOAL.x-START.x),v:0,w:0});
+  rover.quaternion.identity();
+  replans=0; I=0; prevE=0; path=[]; state='IDLE'; phase='DRIVE'; driven=0;
+  paintMap();
+  if(!realistic)sense();
+  setGoal(GOAL.x,GOAL.z);
+  msg='Mission start — no prior map';
+}
+
+let senseT=0, noPathT=0;
+function step(dt){
+  simT+=dt;
+  for(let n=falling.length-1;n>=0;n--){
+    const o=falling[n], g=H(o.x,o.z)+o.r*0.2;
+    o.mesh.position.y=Math.max(g,o.mesh.position.y-24*dt);
+    if(o.mesh.position.y<=g){falling.splice(n,1);rocks.push(o);stamp(o)}
+  }
+  if(realistic){stepStopAndScan(dt);return}
+  drive(dt);
+  senseT+=dt;
+  if(senseT>=0.1){
+    senseT=0;
+    const changed=sense();
+    if(state==='NAVIGATING'&&changed&&blockedAhead()){replans++;msg='Obstacle on path → replanning';plan()}
+  }
+  if(state==='NO PATH'){noPathT+=dt;if(noPathT>1){noPathT=0;plan()}}
+}
+// Realistic cycle: drive a short leg → stop → sweep the camera → compute (A*) → drive again.
+function stepStopAndScan(dt){
+  if(state==='ARRIVED'||state==='IDLE'){drive(dt);return}
+  if(phase==='DRIVE'){
+    if(state==='NAVIGATING'){
+      const x0=S.x,z0=S.z;
+      drive(dt);
+      driven+=Math.hypot(S.x-x0,S.z-z0);
+      if(driven>=DRIVE_DIST)startScan();
+    }else startScan();                    // planning or no path: look around first
+    return;
+  }
+  drive(dt);                              // brakes to a halt (phase !== DRIVE)
+  if(phase==='SCAN'){
+    if(Math.abs(S.v)>0.05)return;
+    scanT+=dt;
+    const a1=-ARC/2+ARC*clamp(scanT/SCAN_DUR,0,1);
+    let changed=false;
+    for(let a=scanA;a<=a1;a+=0.015)changed=castRay(S.th+a)||changed;
+    scanA=a1;
+    senseT+=dt;
+    if(changed&&senseT>=0.1){senseT=0;paintMap()}
+    if(scanT>=SCAN_DUR){paintMap();phase='PROCESS';procT=0;msg='Processing map · planning route'}
+  }else{
+    procT+=dt;
+    if(procT>=PROC_DUR){
+      const hazard=path.length&&blockedAhead();
+      plan();
+      if(hazard){replans++;msg='Hazard on old route → replanned'}else if(state==='NAVIGATING')msg='Route computed';
+      phase='DRIVE'; driven=0; I=0;
+    }
+  }
+}
+
+// ---------- UI ----------
+const hud=document.getElementById('hud');
+let hudT=0;
+function drawHud(){
+  const dist=goal?Math.hypot(goal.x-S.x,goal.z-S.z):0;
+  let len=0;for(let i=Math.max(pi,1);i<path.length;i++)len+=Math.hypot(path[i][0]-path[i-1][0],path[i][1]-path[i-1][1]);
+  let nr=0,ns=0;for(let k=0;k<N*N;k++)if(known[k]===2){if(kind[k]===2)ns++;else nr++}
+  const ph=!realistic?'live mapping':phase==='SCAN'?`scanning ${(100*clamp(scanT/SCAN_DUR,0,1))|0}%`:phase==='PROCESS'?`computing ${(100*clamp(procT/PROC_DUR,0,1))|0}%`:'driving';
+  const sl=Math.atan(slope[cellOf(S.z)*N+cellOf(S.x)])*57.2958;
+  hud.dataset.state=state;
+  hud.textContent=
+`ROVER · VSLAM NAV SIM
+mode     ${realistic?'stop & scan':'continuous'}
+state    ${state}
+phase    ${ph}
+pose     ${S.x.toFixed(1)}, ${S.z.toFixed(1)} m
+heading  ${(S.th*57.2958).toFixed(0)}°
+speed    ${S.v.toFixed(2)} m/s
+tilt     pitch ${tilt.p.toFixed(1)}° roll ${tilt.r.toFixed(1)}°
+slope    ${sl.toFixed(1)}° (max 20°)
+clear    ${clearance().toFixed(2)} m
+goal     ${dist.toFixed(1)} m away
+path     ${path.length} wp · ${len.toFixed(1)} m
+plan     ${lastPlan.ms.toFixed(1)} ms · ${lastPlan.nodes} nodes
+map      ${(100*knownCount/(N*N)).toFixed(1)}% explored
+hazards  ${nr} rock · ${ns} steep cells
+replans  ${replans}
+${msg}`;
+}
+
+// minimap
+const miniC=document.getElementById('miniC'), mc=miniC.getContext('2d'), MS=miniC.width, ms=MS/SIZE;
+const mp=v=>(v+HALF)*ms;
+function drawMini(){
+  mc.imageSmoothingEnabled=false;
+  mc.drawImage(baseC,0,0,MS,MS);
+  mc.drawImage(mapCanvas,0,0,MS,MS);
+  mc.lineWidth=1.5; mc.strokeStyle='#66ffcc';
+  if(state==='NAVIGATING'&&path.length){
+    mc.beginPath(); mc.moveTo(mp(S.x),mp(S.z));
+    for(let i=pi;i<path.length;i++)mc.lineTo(mp(path[i][0]),mp(path[i][1]));
+    mc.stroke();
+  }
+  if(goal){
+    const gx=mp(goal.x), gz=mp(goal.z);
+    mc.beginPath(); mc.arc(gx,gz,5,0,6.283); mc.moveTo(gx-9,gz); mc.lineTo(gx+9,gz); mc.moveTo(gx,gz-9); mc.lineTo(gx,gz+9); mc.stroke();
+  }
+  mc.save(); mc.translate(mp(S.x),mp(S.z)); mc.rotate(S.th);
+  if(fx.show){
+    const r=RANGE*ms, a0=fx.a-fx.dir*SW, a1=fx.a;
+    mc.fillStyle='rgba(102,221,255,.22)';
+    mc.beginPath(); mc.moveTo(0,0); mc.arc(0,0,r,Math.min(a0,a1),Math.max(a0,a1)); mc.fill();
+    mc.strokeStyle='#bff6ff'; mc.beginPath(); mc.moveTo(0,0); mc.lineTo(Math.cos(fx.a)*r,Math.sin(fx.a)*r); mc.stroke();
+  }
+  mc.fillStyle='#ffd27a'; mc.strokeStyle='#140c08';
+  mc.beginPath(); mc.moveTo(8,0); mc.lineTo(-6,5); mc.lineTo(-6,-5); mc.closePath(); mc.fill(); mc.stroke();
+  mc.restore();
+}
+miniC.addEventListener('pointerdown',e=>{
+  const r=miniC.getBoundingClientRect();
+  setGoal((e.clientX-r.left)/r.width*SIZE-HALF,(e.clientY-r.top)/r.height*SIZE-HALF);
+});
+
+let cam='orbit', speed=1, yaw=0, pitch=0, yawT=0, pitchT=0, flySpeed=26, dragMove=false;
+const CAMS=['orbit','chase','free'], held=new Set(), vel=new V3(), kick=new V3();
+const bCam=document.getElementById('bCam'), bSpd=document.getElementById('bSpd'), bMode=document.getElementById('bMode'), bDrag=document.getElementById('bDrag');
+const toggleCam=()=>{
+  cam=CAMS[(CAMS.indexOf(cam)+1)%CAMS.length];
+  controls.enabled=cam==='orbit';
+  if(cam==='orbit')controls.target.copy(rover.position);
+  if(cam==='free'){camera.rotation.setFromQuaternion(camera.quaternion,'YXZ');yaw=yawT=camera.rotation.y;pitch=pitchT=camera.rotation.x}   // start from the current view
+  held.clear(); vel.set(0,0,0); kick.set(0,0,0);
+  bDrag.hidden=cam!=='free';
+  bCam.textContent=`Camera: ${cam} (C)`;
+};
+const toggleDrag=()=>{dragMove=!dragMove;bDrag.textContent=`Drag: ${dragMove?'move':'look'} (X)`};
+// Free-roam camera. Keys: WASD/arrows move, Q/E down/up, Shift fast. Mouse/trackpad: drag looks (or moves, see Drag toggle; right-drag always moves),
+// two-finger scroll looks, pinch or mouse wheel dollies, Alt+wheel sets speed. Every input is eased so motion stays smooth.
+const FLY_KEYS='wasdqe';
+function flyCam(dt){
+  const ease=r=>1-Math.exp(-r*dt);
+  yaw+=(yawT-yaw)*ease(16); pitch+=(pitchT-pitch)*ease(16);
+  camera.rotation.set(pitch,yaw,0,'YXZ');
+  const f=new V3(), r=new V3(), want=new V3();
+  camera.getWorldDirection(f); r.crossVectors(f,camera.up).normalize();
+  const k=c=>held.has(c)||held.has({w:'arrowup',s:'arrowdown',a:'arrowleft',d:'arrowright'}[c]);
+  want.addScaledVector(f,(k('w')?1:0)-(k('s')?1:0)).addScaledVector(r,(k('d')?1:0)-(k('a')?1:0)).y+=(held.has('e')?1:0)-(held.has('q')?1:0);
+  if(want.lengthSq())want.normalize().multiplyScalar(flySpeed*(held.has('shift')?3:1));
+  vel.lerp(want,ease(7));                               // accelerate / glide to a stop
+  camera.position.addScaledVector(vel,dt);
+  const d=ease(14);                                     // drain queued drag / dolly / pinch movement
+  camera.position.addScaledVector(kick,d); kick.multiplyScalar(1-d);
+  camera.position.y=Math.max(camera.position.y,H(camera.position.x,camera.position.z)+0.6);   // stay above ground
+}
+const cycleSpeed=()=>{speed=speed===4?1:speed*2;bSpd.textContent=`Speed ${speed}× (S)`};
+const toggleMode=()=>{
+  realistic=!realistic;
+  bMode.textContent=`Mode: ${realistic?'stop & scan':'continuous'} (M)`;
+  phase='DRIVE'; senseT=0;
+  if(realistic){if(state==='NAVIGATING')startScan()}      // stop and look first
+  else if(goal&&(state==='PLANNING'||state==='NO PATH'))plan();
+};
+bCam.onclick=toggleCam; bSpd.onclick=cycleSpeed; bMode.onclick=toggleMode; bDrag.onclick=toggleDrag;
+document.getElementById('bDrop').onclick=dropAhead;
+document.getElementById('bRst').onclick=reset;
+document.getElementById('help').open=innerWidth>640;   // collapsed on phones so it doesn't cover the scene
+addEventListener('keydown',e=>{
+  if(e.ctrlKey||e.metaKey||e.altKey)return;            // keep Ctrl+R / Ctrl+S etc. for the browser
+  const k=e.key.toLowerCase();
+  if(cam==='free'&&k==='x'){toggleDrag();return}
+  if(cam==='free'&&(FLY_KEYS.includes(k)||k.startsWith('arrow')||k==='shift')){held.add(k);e.preventDefault();return}   // S moves back here; use the Speed button
+  if(k==='o')dropAhead(); else if(k==='c')toggleCam(); else if(k==='s')cycleSpeed(); else if(k==='r')reset(); else if(k==='m')toggleMode();
+});
+addEventListener('keyup',e=>held.delete(e.key.toLowerCase()));
+addEventListener('blur',()=>held.clear());
+
+const ray=new THREE.Raycaster(), el=renderer.domElement;
+let down=null;
+el.addEventListener('pointerdown',e=>{down=[e.clientX,e.clientY,performance.now()];if(cam==='free')el.setPointerCapture(e.pointerId)});
+el.addEventListener('contextmenu',e=>{if(cam==='free')e.preventDefault()});
+el.addEventListener('pointermove',e=>{
+  if(cam!=='free'||!e.buttons)return;
+  if(dragMove||(e.buttons&2)){                          // drag-to-move: the scene follows the hand
+    const f=camera.getWorldDirection(new V3()), r=new V3().crossVectors(f,camera.up).normalize(), u=new V3().crossVectors(r,f), s=0.04*flySpeed/26;
+    kick.addScaledVector(r,-e.movementX*s).addScaledVector(u,e.movementY*s);
+  }else{yawT-=e.movementX*0.003;pitchT=clamp(pitchT-e.movementY*0.003,-1.5,1.5)}
+});
+el.addEventListener('wheel',e=>{
+  if(cam!=='free')return;
+  e.preventDefault();
+  const s=flySpeed/26;
+  if(e.altKey){flySpeed=clamp(flySpeed*(e.deltaY<0?1.15:1/1.15),6,120);return}
+  const mouse=e.deltaMode!==0||(!e.deltaX&&(e.deltaY%100===0||e.deltaY%120===0));   // notched wheel vs smooth trackpad stream
+  if(e.ctrlKey)kick.addScaledVector(camera.getWorldDirection(new V3()),-e.deltaY*0.25*s);          // pinch
+  else if(mouse)kick.addScaledVector(camera.getWorldDirection(new V3()),-e.deltaY*0.04*s);         // wheel notch
+  else{yawT-=e.deltaX*0.004;pitchT=clamp(pitchT-e.deltaY*0.004,-1.5,1.5)}                          // two-finger scroll
+},{passive:false});
+el.addEventListener('pointerup',e=>{
+  if(!down||Math.hypot(e.clientX-down[0],e.clientY-down[1])>5||performance.now()-down[2]>500)return;   // a drag, not a click
+  ray.setFromCamera(new THREE.Vector2(e.clientX/innerWidth*2-1,-(e.clientY/innerHeight)*2+1),camera);
+  const hit=ray.intersectObject(terrain)[0];
+  if(!hit)return;
+  if(e.shiftKey)dropRock(hit.point.x,hit.point.z,0.7+Math.random()*0.5); else setGoal(hit.point.x,hit.point.z);
+});
+addEventListener('resize',()=>{
+  camera.aspect=innerWidth/innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth,innerHeight);
+});
+
+if(new URLSearchParams(location.search).get('mode')==='stop')toggleMode();   // deep link: ?mode=stop
+reset();
+for(let t=0,ff=+new URLSearchParams(location.search).get('ff')||0;t<ff;t+=0.05){step(0.05);applyPose(0.05)}   // deep link: ?ff=30 fast-forwards 30 s of sim
+drawHud();
+let last=performance.now();
+renderer.setAnimationLoop(now=>{
+  const dt=clamp((now-last)/1000,0,0.05); last=now;   // rAF timestamps can precede the setup-time `last`, so never let dt go negative
+  for(let n=0;n<speed;n++)step(dt);
+  applyPose(dt);
+  drawPath();
+  updateFX(dt);
+  updatePoints(dt);
+  if(cam==='chase'){
+    const c=Math.cos(S.th), s=Math.sin(S.th), p=rover.position;
+    camera.position.lerp(new V3(p.x-c*7,p.y+3.5,p.z-s*7),1-Math.exp(-3*dt));
+    camera.lookAt(p.x+c*3,p.y+.8,p.z+s*3);
+  }else if(cam==='free')flyCam(dt);
+  else controls.update();
+  if((hudT+=dt)>0.1){hudT=0;drawHud()}
+  drawMini();
+  renderer.render(scene,camera);
+});
+</script>
+</body>
+</html>
