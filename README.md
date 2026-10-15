@@ -43,6 +43,13 @@ The project's contribution is **integration and visualisation**, not new algorit
 
 ## Quick start
 
+Get the code:
+
+```bash
+git clone https://github.com/ArtisticSyndrome/Rover.git
+cd Rover
+```
+
 **Option 1: just open it.** Double-click `index.html`. It loads Three.js from a CDN (jsDelivr), so you need an internet connection the first time.
 
 **Option 2: serve it locally** (if your browser blocks something on `file://`):
@@ -236,10 +243,15 @@ Ideas for extension: simulated pose drift with loop-closure correction, noisy de
 ```
 index.html        the whole simulator (HTML + CSS + JS module)
 docs/             screenshots used in this README
+LICENSE           MIT
 README.md
 ```
 
 Dependencies (loaded at runtime from jsDelivr, no install): [Three.js](https://threejs.org/) r170 and its `OrbitControls`.
+
+## License
+
+[MIT](LICENSE) © 2026 Vedant Wagh.
 
 ## Credits
 
